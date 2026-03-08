@@ -25,9 +25,9 @@ LR           = 1e-3
 NUM_CLASSES  = 128
 INPUT_H, INPUT_W = 4, 8  # reshape 32 → (1, 4, 8)
 
-# ── .mat key names — adjust if your files use different names ─────────────────
-KEY_INPUT = "inputs"   # shape (N, 32)
-KEY_LABEL = "labels"   # shape (N, 128) one-hot
+# ── .mat key names ────────────────────────────────────────────────────────────
+KEY_INPUT = "X"        # shape (N, 32)
+KEY_LABEL = "best128"  # shape (N, 1) or (N,) — integer beam index (1-indexed)
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -57,7 +57,7 @@ def load_bs(bs_idx: int, is_outdoor: bool) -> BeamDataset:
         top_idx   = np.argsort(max_power)[-TOP_K:]
         X, y      = X[top_idx], y[top_idx]
 
-    labels = np.argmax(y, axis=1).astype(np.int64)     # (N,)
+    labels = y.flatten().astype(np.int64) - 1          # 1-indexed → 0-indexed
     X      = X.reshape(-1, 1, INPUT_H, INPUT_W)        # (N, 1, 4, 8)
     return BeamDataset(X, labels)
 
