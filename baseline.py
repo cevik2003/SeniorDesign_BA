@@ -48,8 +48,8 @@ def load_bs(bs_idx: int, is_outdoor: bool) -> BeamDataset:
     path = os.path.join(DATA_DIR, f"beam_dataset_bs{bs_idx}.mat")
     data = sio.loadmat(path)
 
-    X = data[KEY_INPUT].astype(np.float32)   # (N, 32)
-    y = data[KEY_LABEL].astype(np.float32)   # (N, 128) one-hot
+    X = data[KEY_INPUT].astype(np.float32)          # (N, 32)
+    y = data[KEY_LABEL].astype(np.float32).flatten() # (N,) — handles (1,N) or (N,1)
 
     if is_outdoor:
         # keep top-50k by maximum received power
