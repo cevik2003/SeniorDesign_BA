@@ -57,7 +57,7 @@ def load_raw(bs_idx: int, is_outdoor: bool):
         top_idx = np.argsort(X.max(axis=1))[-TOP_K:]
         X, y    = X[top_idx], y[top_idx]
 
-    labels = y - 1  # 1-indexed → 0-indexed
+    labels = y  # already 0-indexed (0–127)
     assert labels.min() >= 0 and labels.max() < NUM_CLASSES, \
         f"BS{bs_idx}: label out of range [{labels.min()}, {labels.max()}]"
 
