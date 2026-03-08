@@ -1,12 +1,19 @@
 """
 Transfer Learning: Beam Selection via CNN (Last-Layer Fine-Tuning)
+Google Colab single-script — no external checkpoint needed.
 
-Pretrain : same as baseline (BS3–BS13 outdoor, top-50k per BS)
-Fine-tune: only the final FC layer, using N samples drawn from merged
-           BS14+BS15 indoor test data.
-Evaluate : remaining merged BS14+BS15 samples (pretrain support set excluded)
+Pretrain : BS3–BS13 outdoor (top-50k per BS), same as baseline
+Fine-tune: freeze conv features, update only final FC layer
+           using N samples from merged BS14+BS15 indoor test data
+Evaluate : remaining merged BS14+BS15 samples (support set excluded)
 
 Shot counts: 10, 20, 30, ..., 100, 200, 500
+
+── Colab usage ──────────────────────────────────────────────────────────────
+from google.colab import drive
+drive.mount('/content/drive')
+DATA_DIR = "/content/drive/MyDrive/<your-folder>"   # ← change this
+─────────────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -15,12 +22,12 @@ import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, Subset
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR     = "."
-OUTDOOR_BSS  = list(range(3, 14))   # BS3–BS13  (pretrain)
-INDOOR_BSS   = [14, 15]             # BS14–BS15 (fine-tune + test)
+DATA_DIR     = "."                  # ← Colab'da Drive path ile değiştir
+OUTDOOR_BSS  = list(range(3, 14))  # BS3–BS13  (pretrain)
+INDOOR_BSS   = [14, 15]            # BS14–BS15 (fine-tune + test)
 TOP_K        = 50_000
 BATCH_SIZE   = 256
 PRETRAIN_EPOCHS = 100
@@ -34,7 +41,6 @@ KEY_INPUT = "X"
 KEY_LABEL = "best128"
 
 SHOT_COUNTS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 500]
-CHECKPOINT  = "baseline_beamnet.pth"
 SEED        = 42
 
 
@@ -138,8 +144,9 @@ def pretrain(device):
     std = X_train.std(axis=0,  keepdims=True) + 1e-8
 
     train_ds     = make_dataset(X_train, y_train, mu, std)
+    pin = device.type == "cuda"
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              shuffle=True, num_workers=2, pin_memory=True)
+                              shuffle=True, num_workers=0, pin_memory=pin)
     print(f"  Train samples : {len(train_ds):,}\n")
 
     model     = BeamNet().to(device)
@@ -153,23 +160,14 @@ def pretrain(device):
         if epoch % 10 == 0:
             print(f"{epoch:6d}  {tr_loss:10.4f}  {tr_acc*100:9.2f}%")
 
-    torch.save({"model": model.state_dict(), "mu": mu, "std": std}, CHECKPOINT)
-    print(f"\nCheckpoint saved → {CHECKPOINT}\n")
+    print()
     return model, mu, std
 
 
 # ── Transfer Learning ─────────────────────────────────────────────────────────
 def run_transfer(device):
-    # ── Load or pretrain model ────────────────────────────────────────────────
-    if os.path.exists(CHECKPOINT):
-        print(f"Loading pretrained model from {CHECKPOINT} …\n")
-        ckpt = torch.load(CHECKPOINT, map_location=device)
-        base_model = BeamNet().to(device)
-        base_model.load_state_dict(ckpt["model"])
-        mu  = ckpt["mu"]
-        std = ckpt["std"]
-    else:
-        base_model, mu, std = pretrain(device)
+    # ── Pretrain ──────────────────────────────────────────────────────────────
+    base_model, mu, std = pretrain(device)
 
     criterion = nn.CrossEntropyLoss()
 
@@ -186,8 +184,9 @@ def run_transfer(device):
     print(f"  Merged total  : {len(y_indoor):,}\n")
 
     full_ds = make_dataset(X_indoor, y_indoor, mu, std)
+    pin = device.type == "cuda"
     full_loader = DataLoader(full_ds, batch_size=BATCH_SIZE,
-                             num_workers=2, pin_memory=True)
+                             num_workers=0, pin_memory=pin)
 
     _, base_acc = evaluate(base_model, full_loader, criterion, device)
     print(f"Baseline (0-shot, no fine-tune) accuracy : {base_acc*100:.2f}%\n")
@@ -216,7 +215,7 @@ def run_transfer(device):
         support_loader = DataLoader(support_ds, batch_size=min(n_shots, 64),
                                     shuffle=True, num_workers=0)
         query_loader   = DataLoader(query_ds, batch_size=BATCH_SIZE,
-                                    num_workers=2, pin_memory=True)
+                                    num_workers=0, pin_memory=pin)
 
         # Deep-copy base model, freeze features, only train classifier
         model = copy.deepcopy(base_model)
