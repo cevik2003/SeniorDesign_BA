@@ -118,14 +118,16 @@ def train_epoch(model, loader, optimizer, criterion, device):
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     model.eval()
-    total_loss, correct, n = 0.0, 0, 0
+    total_loss, correct1, correct3, n = 0.0, 0, 0, 0
     for X, y in loader:
         X, y = X.to(device), y.to(device)
         logits = model(X)
         total_loss += criterion(logits, y).item() * len(y)
-        correct    += (logits.argmax(1) == y).sum().item()
+        correct1   += (logits.argmax(1) == y).sum().item()
+        top3        = logits.topk(3, dim=1).indices
+        correct3   += (top3 == y.unsqueeze(1)).any(dim=1).sum().item()
         n          += len(y)
-    return total_loss / n, correct / n
+    return total_loss / n, correct1 / n, correct3 / n
 
 
 # ── Pretrain ──────────────────────────────────────────────────────────────────
@@ -190,16 +192,16 @@ def run_transfer(device):
     full_loader = DataLoader(full_ds, batch_size=BATCH_SIZE,
                              num_workers=0, pin_memory=pin)
 
-    _, base_acc = evaluate(base_model, full_loader, criterion, device)
-    print(f"Baseline (0-shot, no fine-tune) accuracy : {base_acc*100:.2f}%\n")
+    _, base_acc, base_acc3 = evaluate(base_model, full_loader, criterion, device)
+    print(f"Baseline (0-shot, no fine-tune) top-1: {base_acc*100:.2f}%  top-3: {base_acc3*100:.2f}%\n")
 
     # ── Last-layer fine-tuning sweep ──────────────────────────────────────────
     rng = np.random.default_rng(SEED)
     N_total = len(full_ds)
     all_indices = np.arange(N_total)
 
-    print(f"{'Shots':>6}  {'Support':>8}  {'Query':>8}  {'Acc (%)':>10}")
-    print("─" * 40)
+    print(f"{'Shots':>6}  {'Support':>8}  {'Query':>8}  {'Top-1 (%)':>10}  {'Top-3 (%)':>10}")
+    print("─" * 52)
 
     results = {}
     for n_shots in SHOT_COUNTS:
@@ -236,17 +238,17 @@ def run_transfer(device):
         for _ in range(FINETUNE_EPOCHS):
             train_epoch(model, support_loader, optimizer, criterion, device)
 
-        _, acc = evaluate(model, query_loader, criterion, device)
-        results[n_shots] = acc
+        _, acc, acc3 = evaluate(model, query_loader, criterion, device)
+        results[n_shots] = (acc, acc3)
 
-        print(f"{n_shots:6d}  {n_shots:8d}  {len(query_idx):8,}  {acc*100:10.2f}%")
+        print(f"{n_shots:6d}  {n_shots:8d}  {len(query_idx):8,}  {acc*100:10.2f}%  {acc3*100:10.2f}%")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print("\n── Summary ───────────────────────────────────────────────────────")
-    print(f"  {'Shots':>6}  {'Accuracy':>10}")
-    print(f"  {'0 (base)':>6}  {base_acc*100:9.2f}%")
-    for n_shots, acc in results.items():
-        print(f"  {n_shots:6d}  {acc*100:9.2f}%")
+    print(f"  {'Shots':>6}  {'Top-1 (%)':>10}  {'Top-3 (%)':>10}")
+    print(f"  {'0 (base)':>6}  {base_acc*100:9.2f}%  {base_acc3*100:9.2f}%")
+    for n_shots, (acc, acc3) in results.items():
+        print(f"  {n_shots:6d}  {acc*100:9.2f}%  {acc3*100:9.2f}%")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
