@@ -1,0 +1,257 @@
+"""
+Transfer Learning: Beam Selection via CNN (Last-Layer Fine-Tuning)
+
+Pretrain : same as baseline (BS3–BS13 outdoor, top-50k per BS)
+Fine-tune: only the final FC layer, using N samples drawn from merged
+           BS14+BS15 indoor test data.
+Evaluate : remaining merged BS14+BS15 samples (pretrain support set excluded)
+
+Shot counts: 10, 20, 30, ..., 100, 200, 500
+"""
+
+import os
+import copy
+import numpy as np
+import scipy.io as sio
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, Subset, ConcatDataset
+
+# ── Config ────────────────────────────────────────────────────────────────────
+DATA_DIR     = "."
+OUTDOOR_BSS  = list(range(3, 14))   # BS3–BS13  (pretrain)
+INDOOR_BSS   = [14, 15]             # BS14–BS15 (fine-tune + test)
+TOP_K        = 50_000
+BATCH_SIZE   = 256
+PRETRAIN_EPOCHS = 100
+PRETRAIN_LR     = 1e-3
+FINETUNE_EPOCHS = 50
+FINETUNE_LR     = 1e-3
+NUM_CLASSES  = 128
+INPUT_H, INPUT_W = 4, 8
+
+KEY_INPUT = "X"
+KEY_LABEL = "best128"
+
+SHOT_COUNTS = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 500]
+CHECKPOINT  = "baseline_beamnet.pth"
+SEED        = 42
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+class BeamDataset(Dataset):
+    def __init__(self, X: np.ndarray, y: np.ndarray):
+        self.X = torch.from_numpy(X)
+        self.y = torch.from_numpy(y)
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, i):
+        return self.X[i], self.y[i]
+
+
+def load_raw(bs_idx: int, is_outdoor: bool):
+    path = os.path.join(DATA_DIR, f"beam_dataset_bs{bs_idx}.mat")
+    data = sio.loadmat(path)
+    X = data[KEY_INPUT].astype(np.float32)
+    y = data[KEY_LABEL].astype(np.int64).flatten()
+    if X.shape[1] != 32:
+        X = X.T
+    if is_outdoor:
+        top_idx = np.argsort(X.max(axis=1))[-TOP_K:]
+        X, y = X[top_idx], y[top_idx]
+    assert y.min() >= 0 and y.max() < NUM_CLASSES, \
+        f"BS{bs_idx}: label out of range [{y.min()}, {y.max()}]"
+    return X, y
+
+
+def make_dataset(X: np.ndarray, y: np.ndarray,
+                 mu: np.ndarray, std: np.ndarray) -> BeamDataset:
+    X = (X - mu) / std
+    X = X.reshape(-1, 1, INPUT_H, INPUT_W)
+    return BeamDataset(X, y)
+
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+class BeamNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1,   32, kernel_size=3, stride=1, padding=1), nn.ReLU(),
+            nn.Conv2d(32,  64, kernel_size=3, stride=1, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 128, kernel_size=1, stride=1, padding=0), nn.ReLU(),
+        )
+        self.classifier = nn.Linear(128 * INPUT_H * INPUT_W, NUM_CLASSES)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = x.flatten(start_dim=1)
+        return self.classifier(x)
+
+
+# ── Train / Eval loops ────────────────────────────────────────────────────────
+def train_epoch(model, loader, optimizer, criterion, device):
+    model.train()
+    total_loss, correct, n = 0.0, 0, 0
+    for X, y in loader:
+        X, y = X.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits = model(X)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * len(y)
+        correct    += (logits.argmax(1) == y).sum().item()
+        n          += len(y)
+    return total_loss / n, correct / n
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss, correct, n = 0.0, 0, 0
+    for X, y in loader:
+        X, y = X.to(device), y.to(device)
+        logits = model(X)
+        total_loss += criterion(logits, y).item() * len(y)
+        correct    += (logits.argmax(1) == y).sum().item()
+        n          += len(y)
+    return total_loss / n, correct / n
+
+
+# ── Pretrain ──────────────────────────────────────────────────────────────────
+def pretrain(device):
+    print("=" * 50)
+    print("PRETRAINING on BS3–BS13 …")
+    print("=" * 50)
+
+    train_Xs, train_ys = [], []
+    for bs in OUTDOOR_BSS:
+        X, y = load_raw(bs, is_outdoor=True)
+        train_Xs.append(X)
+        train_ys.append(y)
+    X_train = np.concatenate(train_Xs, axis=0)
+    y_train = np.concatenate(train_ys, axis=0)
+
+    mu  = X_train.mean(axis=0, keepdims=True)
+    std = X_train.std(axis=0,  keepdims=True) + 1e-8
+
+    train_ds     = make_dataset(X_train, y_train, mu, std)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+                              shuffle=True, num_workers=2, pin_memory=True)
+    print(f"  Train samples : {len(train_ds):,}\n")
+
+    model     = BeamNet().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=PRETRAIN_LR)
+    criterion = nn.CrossEntropyLoss()
+
+    print(f"{'Epoch':>6}  {'Train Loss':>10}  {'Train Acc':>10}")
+    print("─" * 32)
+    for epoch in range(1, PRETRAIN_EPOCHS + 1):
+        tr_loss, tr_acc = train_epoch(model, train_loader, optimizer, criterion, device)
+        if epoch % 10 == 0:
+            print(f"{epoch:6d}  {tr_loss:10.4f}  {tr_acc*100:9.2f}%")
+
+    torch.save({"model": model.state_dict(), "mu": mu, "std": std}, CHECKPOINT)
+    print(f"\nCheckpoint saved → {CHECKPOINT}\n")
+    return model, mu, std
+
+
+# ── Transfer Learning ─────────────────────────────────────────────────────────
+def run_transfer(device):
+    # ── Load or pretrain model ────────────────────────────────────────────────
+    if os.path.exists(CHECKPOINT):
+        print(f"Loading pretrained model from {CHECKPOINT} …\n")
+        ckpt = torch.load(CHECKPOINT, map_location=device)
+        base_model = BeamNet().to(device)
+        base_model.load_state_dict(ckpt["model"])
+        mu  = ckpt["mu"]
+        std = ckpt["std"]
+    else:
+        base_model, mu, std = pretrain(device)
+
+    criterion = nn.CrossEntropyLoss()
+
+    # ── Baseline accuracy (no fine-tuning) on merged indoor data ─────────────
+    print("Loading merged test data (BS14 + BS15) …")
+    indoor_Xs, indoor_ys = [], []
+    for bs in INDOOR_BSS:
+        X, y = load_raw(bs, is_outdoor=False)
+        indoor_Xs.append(X)
+        indoor_ys.append(y)
+        print(f"  BS{bs} samples : {len(y):,}")
+    X_indoor = np.concatenate(indoor_Xs, axis=0)
+    y_indoor = np.concatenate(indoor_ys, axis=0)
+    print(f"  Merged total  : {len(y_indoor):,}\n")
+
+    full_ds = make_dataset(X_indoor, y_indoor, mu, std)
+    full_loader = DataLoader(full_ds, batch_size=BATCH_SIZE,
+                             num_workers=2, pin_memory=True)
+
+    _, base_acc = evaluate(base_model, full_loader, criterion, device)
+    print(f"Baseline (0-shot, no fine-tune) accuracy : {base_acc*100:.2f}%\n")
+
+    # ── Last-layer fine-tuning sweep ──────────────────────────────────────────
+    rng = np.random.default_rng(SEED)
+    N_total = len(full_ds)
+    all_indices = np.arange(N_total)
+
+    print(f"{'Shots':>6}  {'Support':>8}  {'Query':>8}  {'Acc (%)':>10}")
+    print("─" * 40)
+
+    results = {}
+    for n_shots in SHOT_COUNTS:
+        if n_shots >= N_total:
+            print(f"{n_shots:6d}  -- not enough samples --")
+            continue
+
+        # Sample support set indices
+        support_idx = rng.choice(all_indices, size=n_shots, replace=False)
+        query_idx   = np.setdiff1d(all_indices, support_idx)
+
+        support_ds = Subset(full_ds, support_idx.tolist())
+        query_ds   = Subset(full_ds, query_idx.tolist())
+
+        support_loader = DataLoader(support_ds, batch_size=min(n_shots, 64),
+                                    shuffle=True, num_workers=0)
+        query_loader   = DataLoader(query_ds, batch_size=BATCH_SIZE,
+                                    num_workers=2, pin_memory=True)
+
+        # Deep-copy base model, freeze features, only train classifier
+        model = copy.deepcopy(base_model)
+        for param in model.features.parameters():
+            param.requires_grad = False
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=FINETUNE_LR
+        )
+
+        for _ in range(FINETUNE_EPOCHS):
+            train_epoch(model, support_loader, optimizer, criterion, device)
+
+        _, acc = evaluate(model, query_loader, criterion, device)
+        results[n_shots] = acc
+
+        print(f"{n_shots:6d}  {n_shots:8d}  {len(query_idx):8,}  {acc*100:10.2f}%")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\n── Summary ───────────────────────────────────────────────────────")
+    print(f"  {'Shots':>6}  {'Accuracy':>10}")
+    print(f"  {'0 (base)':>6}  {base_acc*100:9.2f}%")
+    for n_shots, acc in results.items():
+        print(f"  {n_shots:6d}  {acc*100:9.2f}%")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device : {device}\n")
+    run_transfer(device)
+
+
+if __name__ == "__main__":
+    main()
