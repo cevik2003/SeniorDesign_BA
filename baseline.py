@@ -57,7 +57,9 @@ def load_bs(bs_idx: int, is_outdoor: bool) -> BeamDataset:
         top_idx   = np.argsort(max_power)[-TOP_K:]
         X, y      = X[top_idx], y[top_idx]
 
-    labels = y.flatten().astype(np.int64) - 1          # 1-indexed → 0-indexed
+    labels = y.flatten().astype(np.int64)
+    if labels.min() >= 1:                              # 1-indexed → 0-indexed
+        labels -= 1
     X      = X.reshape(-1, 1, INPUT_H, INPUT_W)        # (N, 1, 4, 8)
     return BeamDataset(X, labels)
 
@@ -125,14 +127,14 @@ def main():
     train_sets = [load_bs(bs, is_outdoor=True) for bs in OUTDOOR_BSS]
     train_ds   = ConcatDataset(train_sets)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              shuffle=True, num_workers=4, pin_memory=True)
+                              shuffle=True, num_workers=2, pin_memory=True)
     print(f"  Total train samples : {len(train_ds):,}\n")
 
     # ── Build test sets (BS14–BS15, indoor, all users) ─────────────────────────
     print("Loading test data (BS14–BS15) …")
     test_loaders = {
         bs: DataLoader(load_bs(bs, is_outdoor=False), batch_size=BATCH_SIZE,
-                       num_workers=4, pin_memory=True)
+                       num_workers=2, pin_memory=True)
         for bs in INDOOR_BSS
     }
     for bs, loader in test_loaders.items():
