@@ -65,6 +65,11 @@ def load_bs(bs_idx: int, is_outdoor: bool) -> BeamDataset:
     assert labels.min() >= 0 and labels.max() < NUM_CLASSES, \
         f"BS{bs_idx}: label out of range [{labels.min()}, {labels.max()}]"
 
+    # per-sample z-score normalization
+    mu  = X.mean(axis=1, keepdims=True)
+    std = X.std(axis=1,  keepdims=True) + 1e-8
+    X   = (X - mu) / std
+
     X = X.reshape(-1, 1, INPUT_H, INPUT_W)
     return BeamDataset(X, labels)
 
