@@ -35,7 +35,7 @@ PRETRAIN_LR     = 1e-3
 FINETUNE_EPOCHS = 50
 FINETUNE_LR     = 1e-3
 NUM_CLASSES  = 128
-INPUT_H, INPUT_W = 4, 8
+IN_FEATURES  = 32
 
 KEY_INPUT = "X"
 KEY_LABEL = "best128"
@@ -75,25 +75,27 @@ def load_raw(bs_idx: int, is_outdoor: bool):
 def make_dataset(X: np.ndarray, y: np.ndarray,
                  mu: np.ndarray, std: np.ndarray) -> BeamDataset:
     X = (X - mu) / std
-    X = X.reshape(-1, 1, INPUT_H, INPUT_W)
     return BeamDataset(X, y)
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-class BeamNet(nn.Module):
-    def __init__(self):
+class TinyCNN(nn.Module):
+    def __init__(self, in_features=32, num_classes=NUM_CLASSES):
         super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(1,   32, kernel_size=3, stride=1, padding=1), nn.ReLU(),
-            nn.Conv2d(32,  64, kernel_size=3, stride=1, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=1, stride=1, padding=0), nn.ReLU(),
+        self.cnn = nn.Sequential(
+            nn.Conv1d(1, 64, 3, padding=1), nn.ReLU(),
+            nn.Conv1d(64, 64, 3, padding=1), nn.ReLU(),
         )
-        self.classifier = nn.Linear(128 * INPUT_H * INPUT_W, NUM_CLASSES)
+        self.head = nn.Sequential(
+            nn.Linear(64 * in_features, 256), nn.ReLU(),
+            nn.Linear(256, num_classes),
+        )
 
     def forward(self, x):
-        x = self.features(x)
-        x = x.flatten(start_dim=1)
-        return self.classifier(x)
+        x = x.unsqueeze(1)
+        x = self.cnn(x)
+        x = x.flatten(1)
+        return self.head(x)
 
 
 # ── Train / Eval loops ────────────────────────────────────────────────────────
@@ -149,7 +151,7 @@ def pretrain(device):
                               shuffle=True, num_workers=0, pin_memory=pin)
     print(f"  Train samples : {len(train_ds):,}\n")
 
-    model     = BeamNet().to(device)
+    model     = TinyCNN().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=PRETRAIN_LR)
     criterion = nn.CrossEntropyLoss()
 
@@ -217,11 +219,13 @@ def run_transfer(device):
         query_loader   = DataLoader(query_ds, batch_size=BATCH_SIZE,
                                     num_workers=0, pin_memory=pin)
 
-        # Deep-copy base model, freeze features, only train classifier
+        # Deep-copy base model, freeze cnn+first head layer, only train last linear
         model = copy.deepcopy(base_model)
-        for param in model.features.parameters():
+        for param in model.cnn.parameters():
             param.requires_grad = False
-        for param in model.classifier.parameters():
+        for param in model.head[0].parameters():
+            param.requires_grad = False
+        for param in model.head[2].parameters():
             param.requires_grad = True
 
         optimizer = torch.optim.Adam(
