@@ -48,19 +48,24 @@ def load_bs(bs_idx: int, is_outdoor: bool) -> BeamDataset:
     path = os.path.join(DATA_DIR, f"beam_dataset_bs{bs_idx}.mat")
     data = sio.loadmat(path)
 
-    X = data[KEY_INPUT].astype(np.float32)          # (N, 32)
-    y = data[KEY_LABEL].astype(np.float32).flatten() # (N,) — handles (1,N) or (N,1)
+    X = data[KEY_INPUT].astype(np.float32)           # (N, 32)
+    y = data[KEY_LABEL].astype(np.int64).flatten()   # (N,)
+
+    # ensure X is (N, 32) not (32, N)
+    if X.shape[1] != 32:
+        X = X.T
 
     if is_outdoor:
-        # keep top-50k by maximum received power
         max_power = X.max(axis=1)
         top_idx   = np.argsort(max_power)[-TOP_K:]
         X, y      = X[top_idx], y[top_idx]
 
-    labels = y.flatten().astype(np.int64)
-    if labels.min() >= 1:                              # 1-indexed → 0-indexed
-        labels -= 1
-    X      = X.reshape(-1, 1, INPUT_H, INPUT_W)        # (N, 1, 4, 8)
+    # normalize to 0-indexed: MATLAB beam indices are 1-128
+    labels = y - 1
+    assert labels.min() >= 0 and labels.max() < NUM_CLASSES, \
+        f"BS{bs_idx}: label out of range [{labels.min()}, {labels.max()}]"
+
+    X = X.reshape(-1, 1, INPUT_H, INPUT_W)
     return BeamDataset(X, labels)
 
 
