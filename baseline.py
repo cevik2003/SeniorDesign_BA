@@ -4,7 +4,7 @@ Train : BS3–BS13 (outdoor, top-50k users per BS)
 Test  : BS14–BS15 (indoor, all users)
 
 Input  : R^32  (received powers from 32 wide beams)
-Label  : {0,1}^128 one-hot  →  class index 0–127
+Label  : best128 — integer beam index (1-indexed in MATLAB → 0-indexed here)
 """
 
 import os
@@ -15,27 +15,25 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DATA_DIR     = "."          # .mat files directory
+DATA_DIR     = "."
 OUTDOOR_BSS  = list(range(3, 14))   # BS3–BS13  (train)
 INDOOR_BSS   = [14, 15]             # BS14–BS15 (test)
-TOP_K        = 50_000               # keep top-K users for outdoor BSs
+TOP_K        = 50_000
 BATCH_SIZE   = 256
 EPOCHS       = 100
 LR           = 1e-3
 NUM_CLASSES  = 128
-INPUT_H, INPUT_W = 4, 8  # reshape 32 → (1, 4, 8)
+INPUT_H, INPUT_W = 4, 8            # reshape 32 → (1, 4, 8)
 
-# ── .mat key names ────────────────────────────────────────────────────────────
-KEY_INPUT = "X"        # shape (N, 32)
-KEY_LABEL = "best128"  # shape (N, 1) or (N,) — integer beam index (1-indexed)
+KEY_INPUT = "X"
+KEY_LABEL = "best128"
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class BeamDataset(Dataset):
     def __init__(self, X: np.ndarray, y: np.ndarray):
-        # X: (N, 1, 4, 8)  y: (N,) int64
-        self.X = torch.from_numpy(X)
-        self.y = torch.from_numpy(y)
+        self.X = torch.from_numpy(X)   # (N, 1, 4, 8)
+        self.y = torch.from_numpy(y)   # (N,) int64
 
     def __len__(self):
         return len(self.y)
@@ -44,32 +42,31 @@ class BeamDataset(Dataset):
         return self.X[i], self.y[i]
 
 
-def load_bs(bs_idx: int, is_outdoor: bool) -> BeamDataset:
+def load_raw(bs_idx: int, is_outdoor: bool):
+    """Load raw X (N,32) and labels (N,) without normalization."""
     path = os.path.join(DATA_DIR, f"beam_dataset_bs{bs_idx}.mat")
     data = sio.loadmat(path)
 
-    X = data[KEY_INPUT].astype(np.float32)           # (N, 32)
-    y = data[KEY_LABEL].astype(np.int64).flatten()   # (N,)
+    X = data[KEY_INPUT].astype(np.float32)          # (N, 32)
+    y = data[KEY_LABEL].astype(np.int64).flatten()  # (N,)
 
-    # ensure X is (N, 32) not (32, N)
     if X.shape[1] != 32:
         X = X.T
 
     if is_outdoor:
-        max_power = X.max(axis=1)
-        top_idx   = np.argsort(max_power)[-TOP_K:]
-        X, y      = X[top_idx], y[top_idx]
+        top_idx = np.argsort(X.max(axis=1))[-TOP_K:]
+        X, y    = X[top_idx], y[top_idx]
 
-    # normalize to 0-indexed: MATLAB beam indices are 1-128
-    labels = y - 1
+    labels = y - 1  # 1-indexed → 0-indexed
     assert labels.min() >= 0 and labels.max() < NUM_CLASSES, \
         f"BS{bs_idx}: label out of range [{labels.min()}, {labels.max()}]"
 
-    # per-sample z-score normalization
-    mu  = X.mean(axis=1, keepdims=True)
-    std = X.std(axis=1,  keepdims=True) + 1e-8
-    X   = (X - mu) / std
+    return X, labels
 
+
+def make_dataset(X: np.ndarray, labels: np.ndarray, mu: np.ndarray, std: np.ndarray) -> BeamDataset:
+    """Normalize with pre-computed train stats and return dataset."""
+    X = (X - mu) / std
     X = X.reshape(-1, 1, INPUT_H, INPUT_W)
     return BeamDataset(X, labels)
 
@@ -92,9 +89,9 @@ class BeamNet(nn.Module):
         self.classifier = nn.Linear(128 * INPUT_H * INPUT_W, NUM_CLASSES)
 
     def forward(self, x):
-        x = self.features(x)        # (B, 128, 4, 8)
-        x = x.flatten(start_dim=1)  # (B, 4096)
-        return self.classifier(x)   # (B, 128) — logits
+        x = self.features(x)
+        x = x.flatten(start_dim=1)
+        return self.classifier(x)
 
 
 # ── Train / Eval loops ────────────────────────────────────────────────────────
@@ -132,23 +129,34 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}\n")
 
-    # ── Build train set (BS3–BS13, outdoor, top-50k each) ─────────────────────
+    # ── Load raw training data (BS3–BS13) ─────────────────────────────────────
     print("Loading training data (BS3–BS13) …")
-    train_sets = [load_bs(bs, is_outdoor=True) for bs in OUTDOOR_BSS]
-    train_ds   = ConcatDataset(train_sets)
+    train_Xs, train_ys = [], []
+    for bs in OUTDOOR_BSS:
+        X, y = load_raw(bs, is_outdoor=True)
+        train_Xs.append(X)
+        train_ys.append(y)
+    X_train = np.concatenate(train_Xs, axis=0)  # (N_total, 32)
+    y_train = np.concatenate(train_ys, axis=0)
+
+    # ── Compute normalization stats from training data only ───────────────────
+    mu  = X_train.mean(axis=0, keepdims=True)          # (1, 32)
+    std = X_train.std(axis=0,  keepdims=True) + 1e-8   # (1, 32)
+
+    train_ds     = make_dataset(X_train, y_train, mu, std)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
                               shuffle=True, num_workers=2, pin_memory=True)
     print(f"  Total train samples : {len(train_ds):,}\n")
 
-    # ── Build test sets (BS14–BS15, indoor, all users) ─────────────────────────
+    # ── Load test data and normalize with train stats ─────────────────────────
     print("Loading test data (BS14–BS15) …")
-    test_loaders = {
-        bs: DataLoader(load_bs(bs, is_outdoor=False), batch_size=BATCH_SIZE,
-                       num_workers=2, pin_memory=True)
-        for bs in INDOOR_BSS
-    }
-    for bs, loader in test_loaders.items():
-        print(f"  BS{bs} samples : {len(loader.dataset):,}")
+    test_loaders = {}
+    for bs in INDOOR_BSS:
+        X_test, y_test = load_raw(bs, is_outdoor=False)
+        test_ds = make_dataset(X_test, y_test, mu, std)
+        test_loaders[bs] = DataLoader(test_ds, batch_size=BATCH_SIZE,
+                                      num_workers=2, pin_memory=True)
+        print(f"  BS{bs} samples : {len(test_ds):,}")
     print()
 
     # ── Model / optimiser / loss ───────────────────────────────────────────────
@@ -171,7 +179,8 @@ def main():
         print(f"  BS{bs} Top-1 Accuracy : {acc*100:.2f}%")
 
     # ── Save checkpoint ────────────────────────────────────────────────────────
-    torch.save(model.state_dict(), "baseline_beamnet.pth")
+    torch.save({"model": model.state_dict(), "mu": mu, "std": std},
+               "baseline_beamnet.pth")
     print("\nModel saved → baseline_beamnet.pth")
 
 
