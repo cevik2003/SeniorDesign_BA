@@ -478,7 +478,6 @@ def meta_train(device: torch.device):
     print("─" * 55)
 
     for epoch in range(1, META_EPOCHS + 1):
-        scheduler.step()
         model.train()
 
         epoch_loss = 0.0
@@ -525,6 +524,8 @@ def meta_train(device: torch.device):
             lr_clf = optimizer.param_groups[1]['lr']
             print(f"{epoch:6d}  {avg_loss:10.4f}  {avg_acc*100:8.2f}%  "
                   f"{lr_ss:10.6f}  {lr_clf:10.6f}")
+
+        scheduler.step()
 
         if avg_loss < best_loss:
             best_loss = avg_loss
