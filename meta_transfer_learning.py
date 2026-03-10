@@ -295,7 +295,7 @@ class BeamNetMtl(nn.Module):
         Maps standard Conv2d weights → Conv2dMtl frozen base weights.
         Returns (mu, std) for data normalisation.
         """
-        ckpt = torch.load(ckpt_path, map_location='cpu')
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         sd   = ckpt.get('model', ckpt)
 
         # features.0 → conv1, features.2 → conv2, features.4 → conv3
@@ -574,7 +574,7 @@ def meta_test(device: torch.device):
 
     # ── Load meta-trained model ────────────────────────────────────────────
     model = BeamNetMtl(base_lr=BASE_LR, update_step=UPDATE_STEP).to(device)
-    ckpt  = torch.load(META_CKPT, map_location=device)
+    ckpt  = torch.load(META_CKPT, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model'])
     mu  = ckpt['mu']
     std = ckpt['std']
