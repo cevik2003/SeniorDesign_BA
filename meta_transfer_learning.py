@@ -56,6 +56,7 @@ META_LR2        = 0.001    # γ₂ : learning rate for classifier θ (repo: meta
 BASE_LR         = 0.01     # β  : inner-loop LR for Eq.(3)       (repo: base_lr)
 UPDATE_STEP     = 3        # inner-loop gradient steps            (repo: update_step)
 META_EPOCHS     = 100      # outer meta-training epochs
+NUM_BATCH       = 100      # tasks sampled per epoch (repo: num_batch); 11→100
 N_SHOTS_TRAIN   = 10       # support samples per class per task
 QUERY_SAMPLES   = 500      # max query samples per task (capped for memory)
 STEP_SIZE       = 10       # LR scheduler step (repo: step_size)
@@ -431,8 +432,8 @@ def meta_train(device: torch.device):
     """
     Phase 2: Meta-transfer learning.
     Loads pre-trained weights, freezes Θ, learns Φ_S and θ across tasks.
-    Each outdoor BS station is one task.
-    Update order: Eq.(3) → Eq.(4) → Eq.(5) per task.
+    Each epoch samples NUM_BATCH episodes; each episode picks a random BS station.
+    Update order: Eq.(3) → Eq.(4) → Eq.(5) per episode.
     """
     print("=" * 60)
     print("PHASE 2 — Meta-Transfer Learning")
@@ -482,9 +483,11 @@ def meta_train(device: torch.device):
 
         epoch_loss = 0.0
         epoch_acc  = 0.0
-        n_tasks    = len(task_data)
 
-        for X_bs, y_bs in task_data:
+        for _ in range(NUM_BATCH):
+            # ── Pick a random BS station for this episode ──────────────────
+            X_bs, y_bs = task_data[rng.integers(len(task_data))]
+
             # ── Sample support and query for this task ─────────────────────
             X_s, y_s, X_q, y_q = sample_task(
                 X_bs, y_bs, N_SHOTS_TRAIN, QUERY_SAMPLES, rng)
@@ -516,8 +519,8 @@ def meta_train(device: torch.device):
                 epoch_loss += loss_q.item()
                 epoch_acc  += accuracy(logits_q, y_q)
 
-        avg_loss = epoch_loss / n_tasks
-        avg_acc  = epoch_acc  / n_tasks
+        avg_loss = epoch_loss / NUM_BATCH
+        avg_acc  = epoch_acc  / NUM_BATCH
 
         if epoch % 10 == 0:
             lr_ss  = optimizer.param_groups[0]['lr']
